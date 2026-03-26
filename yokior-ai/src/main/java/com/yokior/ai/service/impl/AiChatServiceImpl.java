@@ -59,7 +59,21 @@ public class AiChatServiceImpl implements AiChatService
     @Value("${ai.maxParagraphsPerDoc:10}")
     private Integer maxParagraphsPerDoc;
 
+    @Value("${ai.maxChatMessages:20}")
+    private Integer maxChatMessages;
+
+    @Value("${ai.summaryMaxMessages:10}")
+    private Integer summaryMaxMessages;
+
+    @Value("${ai.summaryMaxTokens:1000}")
+    private Integer summaryMaxTokens;
+
     private final String separator = "【用户问题】";
+
+    private final String summaryPrompt = "请总结以下对话的核心内容，包括用户的主要问题和 AI 的关键回答。\n" +
+            "总结应简洁但完整，保留重要信息，以便后续对话可以基于此继续。\n" +
+            "请用第三人称概述对话内容，不要保留原始对话格式。\n" +
+            "总结内容控制在合理的长度，确保包含所有关键信息。";
 
     private final String systemPrompt = "以下是相关知识库内容，请根据这些内容回答用户的问题。如果相关内容中没有包含答案，请如实说明无法回答\n\n";
 
@@ -284,6 +298,14 @@ public class AiChatServiceImpl implements AiChatService
                 isFrequentQuestion = questionHash != null && qaCacheService.isFrequentQuestion(teamId, questionHash);
             }
 
+            // 检查并执行会话总结（在保存用户消息之前）
+            String providerName = getAiProviderName(options);
+            boolean summarized = checkAndSummarizeSession(finalSessionId, userId, providerName, options);
+            if (summarized)
+            {
+                log.info("会话已总结，后续对话将使用总结后的上下文");
+            }
+
             // 保存用户消息
             ChatMessage userMessage = new ChatMessage();
             userMessage.setId(UUID.randomUUID().toString());
@@ -473,6 +495,136 @@ public class AiChatServiceImpl implements AiChatService
         {
             log.warn("获取指定AI模型失败: {}，将使用默认模型: {}", providerName, defaultProvider);
             return applicationContext.getBean(defaultProvider, AiProvider.class);
+        }
+    }
+
+    @Override
+    public boolean checkAndSummarizeSession(String sessionId, Long userId, String providerName, Map<String, Object> options)
+    {
+        try
+        {
+            // 验证会话归属
+            ChatSession session = chatSessionMapper.selectById(sessionId);
+            if (session == null || !userId.equals(session.getUserId()))
+            {
+                log.warn("会话不存在或无权访问，跳过总结检查：{}", sessionId);
+                return false;
+            }
+
+            // 获取当前消息数量
+            int messageCount = chatMessageMapper.countBySessionId(sessionId);
+            log.debug("会话 {} 当前消息数量：{}, 阈值：{}", sessionId, messageCount, maxChatMessages);
+
+            // 检查是否需要总结（使用 maxChatMessages - 1，因为即将保存一条新消息）
+            if (messageCount >= maxChatMessages - 1)
+            {
+                log.info("消息数量 {} 达到阈值 {}，触发会话总结", messageCount, maxChatMessages);
+
+                // 获取所有历史消息
+                List<ChatMessage> history = chatMessageMapper.selectBySessionId(sessionId);
+
+                // 执行总结
+                String summary = summarizeChatHistory(sessionId, history, providerName, options);
+
+                if (StringUtils.isNotEmpty(summary))
+                {
+                    // 删除旧的对话消息，只保留最近的 summaryMaxMessages 条
+                    List<ChatMessage> recentMessages = chatMessageMapper.selectRecentBySessionId(sessionId, summaryMaxMessages);
+                    if (recentMessages.size() > 0)
+                    {
+                        // 获取需要删除的消息 ID 列表
+                        List<String> allMessageIds = history.stream()
+                                .map(ChatMessage::getId)
+                                .collect(Collectors.toList());
+                        List<String> keepMessageIds = recentMessages.stream()
+                                .map(ChatMessage::getId)
+                                .collect(Collectors.toList());
+
+                        // 删除不在保留列表中的消息
+                        for (String messageId : allMessageIds)
+                        {
+                            if (!keepMessageIds.contains(messageId))
+                            {
+                                chatMessageMapper.deleteById(messageId);
+                            }
+                        }
+                        log.info("已清理旧消息，保留 {} 条最近消息", recentMessages.size());
+                    }
+
+                    // 创建总结消息
+                    ChatMessage summaryMessage = new ChatMessage();
+                    summaryMessage.setId(UUID.randomUUID().toString());
+                    summaryMessage.setSessionId(sessionId);
+                    summaryMessage.setContent("[对话总结]\n" + summary);
+                    summaryMessage.setRole("system");
+                    summaryMessage.setCreateTime(new Date());
+                    chatMessageMapper.insert(summaryMessage);
+                    log.info("已保存总结消息到会话 {}", sessionId);
+
+                    return true;
+                }
+                else
+                {
+                    log.warn("总结内容为空，未执行总结操作");
+                }
+            }
+
+            return false;
+        }
+        catch (Exception e)
+        {
+            log.error("检查并执行会话总结时发生异常", e);
+            return false;
+        }
+    }
+
+    @Override
+    public String summarizeChatHistory(String sessionId, List<ChatMessage> history, String providerName, Map<String, Object> options)
+    {
+        if (history == null || history.isEmpty())
+        {
+            log.debug("历史消息为空，无需总结");
+            return null;
+        }
+
+        try
+        {
+            // 构建总结用的对话历史
+            StringBuilder conversationBuilder = new StringBuilder();
+            conversationBuilder.append("对话历史：\n");
+
+            for (ChatMessage msg : history)
+            {
+                String role = "user".equals(msg.getRole()) ? "用户" : "AI";
+                conversationBuilder.append(role).append(": ").append(msg.getContent()).append("\n");
+            }
+
+            // 构建总结请求的 prompt
+            String summaryRequest = summaryPrompt + "\n\n" + conversationBuilder.toString();
+
+            log.info("开始调用 AI 模型进行对话总结，历史消息数：{}", history.size());
+
+            // 获取 AI 提供者并调用总结
+            AiProvider provider = getAiProvider(options);
+
+            // 使用 getCompletion 方法获取总结（不传入 history，避免递归）
+            String summary = provider.getCompletion(summaryRequest, null, options);
+
+            if (StringUtils.isNotEmpty(summary))
+            {
+                log.info("对话总结完成，总结长度：{} 字符", summary.length());
+                return summary;
+            }
+            else
+            {
+                log.warn("AI 返回的总结内容为空");
+                return null;
+            }
+        }
+        catch (Exception e)
+        {
+            log.error("总结对话历史时发生异常", e);
+            return null;
         }
     }
 
